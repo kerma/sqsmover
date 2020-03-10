@@ -2,6 +2,9 @@ package main
 
 import (
 	"fmt"
+	"io/ioutil"
+	"os"
+	"os/exec"
 	"strconv"
 
 	"github.com/apex/log"
@@ -30,6 +33,7 @@ var (
 	region           = kingpin.Flag("region", "AWS region for source and destination queues.").Short('r').Default("us-west-2").String()
 	profile          = kingpin.Flag("profile", "Use a specific profile from AWS credentials file.").Short('p').Default("").String()
 	limit            = kingpin.Flag("limit", "Limits number of messages moved. No limit is set by default.").Short('l').Default("0").Int()
+	edit             = kingpin.Flag("edit", "Edit the message before moving.").Short('e').Default("false").Bool()
 )
 
 func main() {
@@ -102,7 +106,7 @@ func main() {
 		log.Info(color.New(color.FgCyan).Sprintf("Limit is set, will only move %d messages", numberOfMessages))
 	}
 
-	moveMessages(sourceQueueUrl, destinationQueueUrl, svc, numberOfMessages)
+	moveMessages(sourceQueueUrl, destinationQueueUrl, svc, numberOfMessages, *edit)
 
 }
 
@@ -162,7 +166,7 @@ func convertSuccessfulMessageToBatchRequestEntry(messages []*sqs.Message) []*sqs
 	return result
 }
 
-func moveMessages(sourceQueueUrl string, destinationQueueUrl string, svc *sqs.SQS, totalMessages int) {
+func moveMessages(sourceQueueUrl string, destinationQueueUrl string, svc *sqs.SQS, totalMessages int, edit bool) {
 	params := &sqs.ReceiveMessageInput{
 		QueueUrl:              aws.String(sourceQueueUrl),
 		VisibilityTimeout:     aws.Int64(2),
@@ -212,6 +216,15 @@ func moveMessages(sourceQueueUrl string, destinationQueueUrl string, svc *sqs.SQ
 			messagesToCopy = resp.Messages[0 : totalMessages-messagesProcessed]
 		}
 
+		if edit {
+			err = editMessages(&messagesToCopy)
+			if err != nil {
+				log.Error(color.New(color.FgRed).Sprintf("Couldn't edit message, exiting (%v)", err))
+				return
+			}
+			fmt.Println()
+		}
+
 		batch := &sqs.SendMessageBatchInput{
 			QueueUrl: aws.String(destinationQueueUrl),
 			Entries:  convertToEntries(messagesToCopy),
@@ -258,6 +271,43 @@ func moveMessages(sourceQueueUrl string, destinationQueueUrl string, svc *sqs.SQ
 		b.ValueInt(messagesProcessed)
 		render(b.String())
 	}
+}
+
+func editMessages(messages *[]*sqs.Message) error {
+	for _, m := range *messages {
+		log.Info(color.New(color.FgCyan).Sprintf("Editing message %s... ", *m.MessageId))
+
+		filePath := fmt.Sprintf("%s/%s.message", os.TempDir(), *m.MessageId)
+    	f, err := os.Create(filePath)
+    	if err != nil {
+        	return err
+    	}
+    	f.Write([]byte(*m.Body))
+    	f.Close()
+
+    	cmd := exec.Command("vim", filePath)
+    	cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+
+		err = cmd.Start()
+    	if err != nil {
+    		return err
+    	}
+    	err = cmd.Wait()
+    	if err != nil {
+        	return err
+    	} else {
+    		content, err := ioutil.ReadFile(filePath)
+    		if err != nil {
+    			return err
+			}
+			m.Body = aws.String(string(content))
+			log.Info(color.New(color.FgCyan).Sprintf("Successfully edited."))
+    	}
+	}
+
+	return nil
 }
 
 func buildVersion(version, commit, date, builtBy string) string {
